@@ -1,1 +1,6 @@
 .vscode/settings.json
+settings_private.py
+
+# chache
+__pycache__/
+*.pyc
