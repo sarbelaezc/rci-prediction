@@ -1,6 +1,8 @@
 from django.contrib.auth.models import User, Group
 from rest_framework import viewsets
 from rest_framework import permissions
+from rest_framework.response import Response
+from rest_framework.views import APIView
 from prediction.serializers import UserSerializer, GroupSerializer
 
 
@@ -20,3 +22,13 @@ class GroupViewSet(viewsets.ModelViewSet):
     queryset = Group.objects.all()
     serializer_class = GroupSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+class TrainModelView(APIView):
+
+    def get(self, request, *arg, **kwargs):
+        return Response(True, 200)
+
+class PredictView(APIView):
+
+    def get(self, request, *arg, **kwargs):
+        return Response(True, 200)
