@@ -1,0 +1,209 @@
+---
+title: "Predicción desembolsos"
+author: "Showdown Analytics"
+date: "March 13, 2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Librerías
+
+```{r}
+library(tidymodels)
+library(modeltime)
+library(tidyverse)
+library(timetk)
+library(lubridate)
+```
+
+# Directorio activo
+
+```{r}
+setwd("E:/github/RCI-desembolsos/binaries")
+```
+
+
+# Lectura de datos
+
+```{r}
+desembolsos_raw <- data.table::fread("G:/SASData/Andres_Franco/AA_Insumos/Mina_Marketing/RCI_DESEMBOLSOS_01.csv") %>% 
+  as_tibble()
+```
+
+# ETL
+
+```{r}
+desembolsos <- desembolsos_raw %>% 
+  mutate(fecha_desembolso = dmy(`Fecha Desembolso`))
+```
+
+
+# Definir time series semanal
+
+```{r}
+desembolsos %>% glimpse()
+
+desembolsos_ts <- desembolsos %>% 
+  group_by(fecha = tsibble::yearweek(fecha_desembolso)) %>%
+  filter(!is.na(fecha)) %>% 
+  summarize(n = n()) %>%
+  mutate(fecha = as_date(fecha))
+```
+
+# Timetk diagnostics
+
+```{r}
+# Time series
+desembolsos_ts %>% 
+  plot_time_series(fecha, n)
+
+# Anomaly diagnostics
+desembolsos_ts %>% 
+  plot_anomaly_diagnostics(fecha, n)
+
+# Seasonal diagnostics
+desembolsos_ts %>% 
+  plot_seasonal_diagnostics(fecha, n)
+
+# ACF y PACF
+desembolsos_ts %>% 
+  plot_acf_diagnostics(fecha, n)
+```
+
+# Split 80-20
+
+```{r}
+splits <- initial_time_split(desembolsos_ts, prop = 0.9)
+```
+
+# Models
+
+## Model 1: auto_arima ----
+
+```{r}
+model_fit_arima_no_boost <- arima_reg() %>%
+    set_engine(engine = "auto_arima") %>%
+    fit(n ~ fecha, data = training(splits))
+```
+
+## Model 2: arima_boost ----
+
+```{r}
+model_fit_arima_boosted <- arima_boost(
+    min_n = 2,
+    learn_rate = 0.015
+) %>%
+    set_engine(engine = "auto_arima_xgboost") %>%
+    fit(n ~ fecha + as.numeric(fecha) + factor(month(fecha, label = TRUE), ordered = F),
+        data = training(splits))
+```
+
+## Model 3: ets ----
+
+```{r}
+model_fit_ets <- exp_smoothing() %>%
+    set_engine(engine = "ets") %>%
+    fit(n ~ fecha, data = training(splits))
+```
+
+## Model 4: prophet ----
+
+```{r}
+model_fit_prophet <- prophet_reg() %>%
+    set_engine(engine = "prophet") %>%
+    fit(n ~ fecha, data = training(splits))
+```
+
+## Model 5: lm ----
+
+```{r}
+model_fit_lm <- linear_reg() %>%
+    set_engine("lm") %>%
+    fit(n ~ as.numeric(fecha) + factor(month(fecha, label = TRUE), ordered = FALSE),
+        data = training(splits))
+```
+        
+## Model 6: earth ----
+
+```{r}
+model_spec_mars <- mars(mode = "regression") %>%
+    set_engine("earth") 
+
+recipe_spec <- recipe(n ~ fecha, data = training(splits)) %>%
+    step_date(fecha, features = "week", ordinal = FALSE) %>%
+    step_mutate(date_num = as.numeric(fecha)) %>%
+    step_normalize(date_num) %>%
+    step_rm(fecha)
+  
+wflw_fit_mars <- workflow() %>%
+    add_recipe(recipe_spec) %>%
+    add_model(model_spec_mars) %>%
+    fit(training(splits))
+```
+
+# Model table
+
+```{r}
+models_tbl <- modeltime_table(
+    model_fit_arima_no_boost,
+    model_fit_arima_boosted,
+    model_fit_ets,
+    model_fit_prophet,
+    model_fit_lm,
+    wflw_fit_mars
+)
+
+models_tbl
+```
+
+# Calibrate
+
+```{r}
+calibration_tbl <- models_tbl %>%
+    modeltime_calibrate(new_data = testing(splits))
+```
+
+# Forecast
+
+```{r}
+calibration_tbl %>%
+    modeltime_forecast(
+        new_data    = testing(splits),
+        actual_data = desembolsos_ts
+    ) %>% 
+  plot_modeltime_forecast(.conf_interval_show = FALSE)
+```
+
+# Performance
+
+```{r}
+calibration_tbl %>%
+    modeltime_accuracy() %>%
+    table_modeltime_accuracy()
+```
+
+# Refit the best
+
+```{r}
+refit_tbl <- calibration_tbl %>%
+    modeltime_refit(data = desembolsos_ts)
+
+refit_tbl %>%
+    modeltime_forecast(h = "4 weeks", actual_data = desembolsos_ts) %>%
+    plot_modeltime_forecast()
+```
+
+# Writing
+
+```{r}
+refit_tbl %>%
+    modeltime_forecast(h = "4 weeks", actual_data = desembolsos_ts) %>%
+  filter(.model_desc != "ACTUAL") %>% 
+  write_csv2("../outputs/prueba_2_model_time.csv")
+```
+

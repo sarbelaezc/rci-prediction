@@ -1,0 +1,90 @@
+---
+title: "Predicción desembolsos"
+author: "Showdown Analytics"
+date: "March 13, 2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Librerías
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(lubridate)
+library(fable)
+library(tsibble)
+```
+
+# Directorio activo
+
+```{r}
+setwd("E:/github/RCI-desembolsos/binaries")
+```
+
+
+# Lectura de datos
+
+```{r}
+desembolsos_raw <- fread("G:/SASData/Andres_Franco/AA_Insumos/Mina_Marketing/RCI_DESEMBOLSOS_01.csv") %>% 
+  as_tibble()
+```
+
+# ETL
+
+```{r}
+desembolsos <- desembolsos_raw %>% 
+  mutate(fecha_desembolso = dmy(`Fecha Desembolso`))
+```
+
+
+# EDA
+
+```{r}
+desembolsos %>% glimpse()
+
+desembolsos_ts <- desembolsos %>% 
+  group_by(fecha = tsibble::yearweek(fecha_desembolso)) %>%
+  filter(!is.na(fecha)) %>% 
+  summarize(n = n()) %>% 
+  as_tsibble()
+
+#Plot
+desembolsos_ts %>% 
+  ggplot(aes(x = fecha, y = n)) +
+  geom_line()
+
+```
+
+# Models - pruebita
+
+```{r}
+desembolsos_models <- desembolsos_ts %>%
+  fill_gaps() %>% 
+    model(
+    arima = ARIMA(log(n))
+  )
+
+desembolsos_forecast <- desembolsos_models %>% 
+  forecast(h = "4 weeks") 
+
+desembolsos_forecast %>% 
+  autoplot(filter(desembolsos_ts, tsibble::yearweek(fecha) > yearweek("2020-06-01")))
+```
+
+
+# Writing
+
+```{r}
+desembolsos_forecast %>%
+  mutate(fecha = as_date(fecha)) %>%
+  as_tibble() %>%
+  select(-n) %>% 
+  write_csv("../outputs/prueba_1_arima.csv")
+```
+

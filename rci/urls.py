@@ -16,16 +16,25 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import include, path
 from rest_framework import routers
-from prediction import views
+from prediction.views import UserViewSet, GroupViewSet
 import prediction
+from .views import index, user
+# from django.views.generic.base import TemplateView
 
 router = routers.DefaultRouter()
-router.register(r'users', views.UserViewSet)
-router.register(r'groups', views.GroupViewSet)
+router.register(r'users', UserViewSet)
+router.register(r'groups', GroupViewSet)
 
+# Backend endpoints
 urlpatterns = [
     path('',include(router.urls)),
     path('admin/', admin.site.urls),
     path('api-auth/', include('rest_framework.urls', namespace='rest_framework')),
     path('prediction/', include('prediction.urls')),
 ]
+
+# Frontend endpoints
+urlpatterns += [
+    path('index/', index, name='index'),
+    path('user/', user, name='user'),
+] 

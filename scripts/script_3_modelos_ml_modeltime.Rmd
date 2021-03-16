@@ -1,0 +1,319 @@
+---
+title: "Predicción desembolsos"
+author: "Showdown Analytics"
+date: "March 13, 2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Librerías
+
+```{r}
+library(tidymodels)
+library(modeltime)
+library(tidyverse)
+library(timetk)
+library(lubridate)
+```
+
+# Directorio activo
+
+```{r}
+setwd("E:/github/RCI-desembolsos/binaries")
+```
+
+
+# Lectura de datos
+
+```{r}
+desembolsos_raw <- data.table::fread("G:/SASData/Andres_Franco/AA_Insumos/Mina_Marketing/RCI_DESEMBOLSOS_01.csv") %>% 
+  as_tibble()
+```
+
+# ETL
+
+```{r}
+desembolsos <- desembolsos_raw %>% 
+  mutate(fecha_desembolso = dmy(`Fecha Desembolso`),
+         zona_id = case_when(is.na(`Zona RCI`) ~ "desconocida",
+                                          TRUE ~ as.character(`Zona RCI`)),
+         estado_id = `N/U`)
+```
+
+
+# Definir time series semanal
+
+```{r}
+desembolsos %>% glimpse()
+
+desembolsos_ts <- desembolsos %>%
+  filter(!is.na(fecha_desembolso)) %>% 
+  group_by(fecha_desembolso, zona_id, estado_id) %>%
+  summarize(n_desem = n()) %>% 
+  ungroup()
+```
+
+# Timetk diagnostics
+
+```{r}
+# Time series
+desembolsos_ts %>%
+  filter(zona_id == "1") %>% 
+  plot_time_series(fecha_desembolso, n_desem)
+
+# Anomaly diagnostics
+desembolsos_ts %>%
+  filter(zona_id == "1") %>% 
+  plot_anomaly_diagnostics(fecha_desembolso, n_desem)
+
+# Seasonal diagnostics
+desembolsos_ts %>%
+  filter(zona_id == "1") %>% 
+  plot_seasonal_diagnostics(fecha_desembolso, n_desem)
+
+# ACF y PACF
+desembolsos_ts %>%
+  filter(zona_id == "1") %>% 
+  plot_acf_diagnostics(fecha_desembolso, n_desem)
+```
+
+# Prepare full data 
+
+```{r}
+#Perform hierarchical aggregations
+full_data_tbl <- desembolsos_ts %>% 
+  add_column(all_zones_id = "all_zones", .before = 2) %>% 
+  pivot_longer(cols = ends_with("_id"),
+               names_to = "category",
+               values_to = "identifier") %>% 
+  group_by(category, identifier, fecha_desembolso) %>% 
+  summarize(n_desem = sum(n_desem, na.rm = TRUE)) %>% 
+  ungroup() %>%
+  
+  ############## FEATURE ENGINEERING
+  group_by(category, identifier) %>% 
+  
+  # FILL MISSING DAYS WITH 0
+  pad_by_time(fecha_desembolso, .by = "day", .pad_value = 0) %>%
+  
+  # CREATE A FUTURE FRAME TO MAKE A MONTHLY PREDICTION
+  future_frame(fecha_desembolso, .length_out = 28, .bind_data = TRUE) %>%
+  
+  # CREATE LAGS FOR THE DESEM
+  tk_augment_lags(n_desem, .lags = 28) %>%
+  
+  # SLIDE ROLLING AVERAGES FOR DIFFERENT WEEKLY PERIODS
+  tk_augment_slidify(
+    n_desem_lag28,
+    .f = ~mean(., na.rm = TRUE),
+    .period = c(7, 14, 28, 28*2),
+    .align = "center",
+    .partial = TRUE
+  ) %>%
+  ungroup()
+
+data_prepared_tbl <- full_data_tbl %>% 
+  filter(!is.na(n_desem),
+         !is.na(n_desem_lag28))
+
+future_data_tbl <- full_data_tbl %>% 
+  filter(is.na(n_desem))
+```
+
+Aquí va el TIME SERIES FEATURE ENGINEERING!!!! definiendo el objeto full_data_table
+
+# Split 28 days
+
+```{r}
+splits <- data_prepared_tbl %>% 
+  time_series_split(fecha_desembolso, assess = 28, cumulative = TRUE)
+
+splits %>% 
+  tk_time_series_cv_plan() %>% 
+  plot_time_series_cv_plan(fecha_desembolso, n_desem)
+```
+
+# Recipe
+
+```{r}
+recipe_spec <- recipe(n_desem ~ ., data = training(splits)) %>% 
+  update_role(fecha_desembolso, new_role = "id") %>% 
+  step_timeseries_signature(fecha_desembolso) %>% 
+  step_rm(matches("(.xts$)|(.iso$)|(hour)|(minute)|(second)|(am.pm)")) %>% 
+  step_dummy(all_nominal(), one_hot = TRUE)
+
+# Before the recipe
+recipe_spec %>% summary()
+# After the recipe
+recipe_spec %>% prep() %>% summary()
+
+prep(recipe_spec) %>% juice() %>% glimpse()
+```
+
+Need to add lags for this to work!!
+
+# Models
+
+## Model 1: XGBoost
+
+```{r}
+wf_fit_xgb_default <- workflow() %>% 
+  add_model(boost_tree(mode = "regression") %>%
+            set_engine("xgboost")) %>% 
+  add_recipe(recipe_spec) %>% 
+  fit(training(splits))
+```
+
+## Model 6: some other
+
+```{r}
+
+```
+
+# Model table
+
+```{r}
+models_tbl <- modeltime_table(
+  wf_fit_xgb_default
+)
+
+models_tbl
+```
+
+# Calibrate
+
+```{r}
+calibration_tbl <- models_tbl %>%
+    modeltime_calibrate(new_data = testing(splits))
+```
+
+# Performance
+
+```{r}
+calibration_tbl %>%
+    modeltime_accuracy() %>%
+    table_modeltime_accuracy()
+```
+
+# Forecast
+
+```{r}
+test_forecast_tbl <- calibration_tbl %>%
+    modeltime_forecast(
+        new_data    = testing(splits),
+        actual_data = data_prepared_tbl,
+        keep_data = TRUE
+    ) 
+
+test_forecast_tbl %>% 
+  plot_modeltime_forecast()
+```
+
+# Visualization filters
+
+```{r}
+zona_items <- c("1", "2", "3", "4", "desconocida")
+
+# Por zona
+test_forecast_tbl %>% 
+  filter(identifier %in% zona_items) %>%
+  group_by(identifier) %>% 
+  filter_by_time(.start_date = last(fecha_desembolso) %-time% "6 month",
+                 .end_date = "end") %>% 
+  plot_modeltime_forecast(
+    .facet_ncol = 2
+  )
+
+# Por tipo de vehículo
+test_forecast_tbl %>%
+  filter(category %in% "estado_id") %>%
+  group_by(identifier) %>% 
+  filter_by_time(.start_date = last(fecha_desembolso) %-time% "6 month",
+                 .end_date = "end") %>% 
+  plot_modeltime_forecast()
+
+# Todas las zonas
+test_forecast_tbl %>%
+  filter(category %in% "all_zones_id") %>%
+  filter_by_time(.start_date = last(fecha_desembolso) %-time% "6 month",
+                 .end_date = "end") %>% 
+  plot_modeltime_forecast()
+```
+
+# Accuracy by zona_id and estado_id
+
+```{r}
+accuracy_by_identifier_tbl <- test_forecast_tbl %>% 
+  select(category, identifier, .model_desc, .index, .value) %>% 
+  pivot_wider(
+    names_from = .model_desc,
+    values_from = .value
+  ) %>% 
+  filter(!is.na(XGBOOST)) %>% 
+  pivot_longer(cols = XGBOOST) %>% 
+  group_by(category, identifier, name) %>% 
+  summarize_accuracy_metrics(
+    truth = ACTUAL,
+    estimate = value,
+    metric_set = default_forecast_accuracy_metric_set()
+  )
+
+## Select the best rmse
+best_rmse_by_identifier_tbl <- accuracy_by_identifier_tbl %>% 
+  group_by(identifier) %>% 
+  slice_min(rmse, n = 1) %>% 
+  ungroup()
+```
+
+# Refit the best
+
+```{r}
+refit_tbl <- calibration_tbl %>%
+    modeltime_refit(data = data_prepared_tbl)
+
+future_forecast_tbl <- refit_tbl %>%
+    modeltime_forecast(new_data = future_data_tbl, 
+                       actual_data = data_prepared_tbl,
+                       keep_data = TRUE) 
+# Por Zona
+future_forecast_tbl %>%
+  filter(identifier %in% zona_items) %>%
+  group_by(identifier) %>% 
+  filter_by_time(.start_date = last(fecha_desembolso) %-time% "6 month",
+                 .end_date = "end") %>% 
+  plot_modeltime_forecast(
+    .facet_ncol = 3
+  )
+
+# Por tipo de vehículo
+future_forecast_tbl %>%
+  filter(category %in% "estado_id") %>%
+  group_by(identifier) %>% 
+  filter_by_time(.start_date = last(fecha_desembolso) %-time% "6 month",
+                 .end_date = "end") %>% 
+  plot_modeltime_forecast(
+    .facet_ncol = 3
+  )
+
+# Todas las zonas
+future_forecast_tbl %>%
+  filter(category %in% "all_zones_id") %>%
+  filter_by_time(.start_date = last(fecha_desembolso) %-time% "6 month",
+                 .end_date = "end") %>% 
+  plot_modeltime_forecast()
+```
+
+# Writing
+
+```{r}
+future_forecast_tbl %>%
+  filter(.model_desc != "ACTUAL") %>%
+  select(-.key, -c(fecha_desembolso:n_desem_lag28_roll_56)) %>%
+  write_csv2("../outputs/prueba_3_model_time_serio.csv")
+```
+
